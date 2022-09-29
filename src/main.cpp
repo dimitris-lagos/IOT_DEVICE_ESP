@@ -1,18 +1,20 @@
 #include "main.h"
 #include "page1.h"
 
+
 const long utcOffsetInSeconds = 0; // 7200 for greece(UTC+2)
 WiFiUDP ntpUDP;
+WakeOnLan WOL(ntpUDP);
 NTPClient timeClient(ntpUDP, "pool.ntp.org", utcOffsetInSeconds);
 File uploadFile;
 File webFile;
 bool hasSD = false;
-ESP8266WebServer server(80);
-WebSocketsServer webSocket = WebSocketsServer(81); // create a websocket server on port 81
+AsyncWebServer server(80);
+AsyncWebSocket webSocket("/ws");
 MDNSResponder mdns;
 short cnt = 0;
-char ssid[] = "MY_SSID";
-char password[] = "MY_PASSWORD";
+char ssid[] = "SSID";
+char password[] = "WPA_PASS";
 Ticker tick;
 IPAddress local_ip(192, 168, 4, 1);
 IPAddress gateway(192, 168, 4, 1);
@@ -28,6 +30,10 @@ float secs = 0.00;
 //************************************************************************************//
 void setup()
 {
+// esp_log_level_set("*", ESP_LOG_ERROR);        // set all components to ERROR level
+// esp_log_level_set("wifi", ESP_LOG_WARN);      // enable WARN logs from WiFi stack
+// esp_log_level_set("dhcpc", ESP_LOG_INFO);     // enable INFO logs from DHCP client
+
   analogWriteFreq(100);
   setRouterConnect();
   pinMode(LED_BUILTIN, OUTPUT);
@@ -45,40 +51,38 @@ void setup()
   }
   DBG_OUTPUT_PORT.println("mDNS responder started. Visit:");
   DBG_OUTPUT_PORT.println("http://esp8266.local/");
-
+  WOL.calculateBroadcastAddress(WiFi.localIP(), WiFi.subnetMask()); // Optional  => To calculate the broadcast address, otherwise 255.255.255.255 is used (which is denied in some networks).
   setupWebServerOnRequests();
+
+    // attach AsyncWebSocket
+  webSocket.onEvent(onWebSocketEvent);// handle websocket
+  server.addHandler(&webSocket);
   server.begin();
-  webSocket.begin();
-  webSocket.onEvent(webSocketEvent); // handle websocket
+
 //  Add service to MDNS-SD
   MDNS.addService("http", "tcp", 80);
 
   timeClient.update();
   unsigned long time = timeClient.getEpochTime();
   logDataToSD("datalog.txt", "time:" + String(time) + "\n");
-  DBG_OUTPUT_PORT.println(time);
 }
-
 //************************************************************************************//
 //             Loop Function                                                          //
 //************************************************************************************//
 void loop()
 {
   MDNS.update();
-  webSocket.loop();
-  server.handleClient(); // Handling incoming client requests
   if (DBG_OUTPUT_PORT.available() > 0)
   {
     char c[] = {(char)DBG_OUTPUT_PORT.read()};
-
-    webSocket.broadcastTXT(c, sizeof(c));
+    webSocket.textAll(c, sizeof(c));
   }
   if (intervalPassed(&previousMillis, MIN_INTERVAL))
   {
     DhtSensorData tempData = readDhtSensorData();
     String jsonString = "{\"type\": \"sensor\",\"temperature\":" + String(tempData.temperature) + ",\"humidity\":" + String(tempData.humidity) + "}";
     String dataLog = String(tempData.temperature) + "," + String(tempData.humidity) + "\n";
-    webSocket.broadcastTXT(jsonString);
+    webSocket.textAll(jsonString);
     logDataToSD("datalog.txt", dataLog);
     DBG_OUTPUT_PORT.println(jsonString);
   }
@@ -89,20 +93,82 @@ void loop()
 //************************************************************************************//
 void setupWebServerOnRequests()
 {
-  server.on("/cached", []()
-            { server.send_P(200, "text/html", webpage); });
+  server.on("/cached", [](AsyncWebServerRequest *request){ 
+     request->send_P(200, "text/html", webpage); });
 
-  server.on("/get", HTTP_GET, []()
-            {
-          String state = server.arg("input1");
-          server.send(200, "text/plain", "You sent: " + state); });
-  server.on("/xml", XMLcontent); // handle ajax
+  server.on("/get", HTTP_GET, [](AsyncWebServerRequest *request){
+    //Check if GET parameter exists
+    if(request->hasParam("input1")){
+      handleGetRequest(request);
+    }
+  });
+  server.on("/xml", [](AsyncWebServerRequest *request) {
+    handleXMLRequest(request);}); // handle ajax
 
-  server.on(
-      "/edit", HTTP_POST, []()
-      { returnOK(); },
-      handleFileUpload);
-  server.onNotFound(handleNotFound);
+  server.on("/edit", HTTP_POST, [](AsyncWebServerRequest *request)
+      { returnOK(request); }, onUpload);
+
+  server.onNotFound(onRequest);
+}
+
+void handleGetRequest(AsyncWebServerRequest *request){
+  AsyncWebParameter* p = request->getParam("input1");
+  String argValue = p->value().c_str();
+
+  if(argValue.equals("wol")){
+    wakeMyPC();
+    request->send(200, "text/plain", "Trying to wake up PowerPc");
+  }else if(argValue.equals("sdcard")){
+    handleListSDCardFiles(request);
+  }
+  else{
+    request->send(400, "text/plain", "");
+  }
+}
+
+void handleListSDCardFiles(AsyncWebServerRequest *request){
+  if(hasSD){
+    String topHtml = "<!DOCTYPE html><html><style>table, th, td {border:1px solid black;}</style><body><h2>SD Card Contents</h2><table style=\"width:100%\"><tr><th>File Name</th><th>File Size</th><th>Created</th></tr>";
+    String bottomHtml = "</table></body></html>";
+    File root = SD.open("/");
+    topHtml.concat(getSDCardList(root));
+    topHtml.concat(bottomHtml);
+
+    request->send(200, "text/html", topHtml);
+  }else{
+    request->send(500, "text/plain", "");
+  }
+}
+
+String getSDCardList(File dir) {
+  String html ;
+  File entry;
+  while (entry = dir.openNextFile()) {
+    html.concat("<tr>");
+    html.concat("<td>");
+    html.concat("<p><a href=\"/");
+    html.concat(entry.name());
+    html.concat("\">");
+    html.concat(entry.name());
+    html.concat("</a></p>");
+    html.concat("</td>");
+
+    html.concat("<td>");
+    html.concat(file_size(entry.size()));
+    html.concat("</td>");
+
+    html.concat("<td>");
+    time_t cr = entry.getCreationTime();
+    struct tm* tmstruct = localtime(&cr);
+    char creationDate[22];
+    sprintf(creationDate,"%02d-%02d-%d  %02d:%02d:%02d", tmstruct->tm_mday, (tmstruct->tm_mon) + 1, (tmstruct->tm_year) + 1900, tmstruct->tm_hour, tmstruct->tm_min, tmstruct->tm_sec);
+    html.concat(creationDate);
+    html.concat("</td>");
+
+    html.concat("</tr>");
+    entry.close();
+    }
+  return html;
 }
 
 //************************************************************************************//
@@ -128,13 +194,13 @@ boolean initSD()
 //************************************************************************************//
 //    xxxNOT_USEDxxx  Handle loading and sending index.htm from the SD                //
 //************************************************************************************//
-void handlePageFromSD()
+void handlePageFromSD(AsyncWebServerRequest *request)
 {
   if (hasSD)
   {
     if (!SD.exists("index.htm"))
     {
-      server.send(404, "text/plain", "Page Not Found");
+      request->send(404, "text/plain", "Page Not Found");
       DBG_OUTPUT_PORT.println("ERROR - Can't find index.htm file!");
       return;
     }
@@ -145,19 +211,19 @@ void handlePageFromSD()
       char ltr = webFile.read();
       page += ltr;
     }
-    server.send(200, "text/html", page);
+    request->send(200, "text/html", page);
     webFile.close();
   }
   else
   {
-    server.send(404, "text/plain", "SD Card Not Found");
+    request->send(404, "text/plain", "SD Card Not Found");
   }
 }
 
 //************************************************************************************//
 //                Handle creation and sending of the XML Content                      //
 //************************************************************************************//
-void XMLcontent()
+void handleXMLRequest(AsyncWebServerRequest *request)
 {
 
   String XML;
@@ -194,8 +260,9 @@ void XMLcontent()
     XML += "</status>";
   }
   DBG_OUTPUT_PORT.print("Client connected: ");
-  DBG_OUTPUT_PORT.println(server.client().remoteIP());
-  server.send(200, "text/xml", XML);
+  IPAddress client_ip = request->client()->remoteIP();
+  DBG_OUTPUT_PORT.println(client_ip);
+  request->send(200, "text/xml", XML);
 }
 
 //************************************************************************************//
@@ -281,19 +348,19 @@ DhtSensorData readDhtSensorData()
   return datastruct;
 }
 
-void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
+void onWebSocketEvent(AsyncWebSocket * server, AsyncWebSocketClient * client, AwsEventType type, void * arg, uint8_t *data, size_t length)
 {
-  if (type == WStype_CONNECTED)
+  if (type == WS_EVT_CONNECT)
   {
-    DhtSensorData tempData = readDhtSensorData();
-    String jsonString = "{\"type\": \"sensor\",\"temperature\":" + String(tempData.temperature) + ",\"humidity\":" + String(tempData.humidity) + "}";
+    //DhtSensorData tempData = readDhtSensorData();
+    //String jsonString = "{\"type\": \"sensor\",\"temperature\":" + String(tempData.temperature) + ",\"humidity\":" + String(tempData.humidity) + "}";
     // webSocket.broadcastTXT(jsonString);
   }
-  else if (type == WStype_TEXT && length > 0)
+  else if (type == WS_EVT_DATA && length > 0)
   {
-    if (payload[0] == '#')
+    if (data[0] == '#')
     {
-      uint16_t fanpwm = (uint16_t)strtol((const char *)&payload[1], NULL, 10);
+      uint16_t fanpwm = (uint16_t)strtol((const char *)&data[1], NULL, 10);
       fanpwm = 1024 - fanpwm;
       analogWrite(LED_BUILTIN, fanpwm);
       DBG_OUTPUT_PORT.print("fanpwm= ");
@@ -304,109 +371,110 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
       DBG_OUTPUT_PORT.print("Serial Received: ");
       for (unsigned int i = 0; i < length; i++)
       {
-        DBG_OUTPUT_PORT.print((char)payload[i]);
+        DBG_OUTPUT_PORT.print((char)data[i]);
       }
       DBG_OUTPUT_PORT.println();
     }
   }
 }
-void returnOK()
+
+void returnOK(AsyncWebServerRequest *request)
 {
-  server.send(200, "text/plain", "");
+  request->send(200, "text/plain", "");
 }
 
-void returnFail(String msg)
+void returnFail(AsyncWebServerRequest *request, String msg)
 {
-  server.send(500, "text/plain", msg + "\r\n");
+  request->send(500, "text/plain", msg + "\r\n");
 }
 
-void handleFileUpload()
+void onUpload(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final)
 {
-  if (server.uri() != "/edit")
+  if (request->url() != "/edit")
   {
-    server.send(404, "text/plain", "Wrong Page!");
+    request->send(404, "text/plain", "Wrong Page!");
     return;
   }
   if (!hasSD)
   {
-    server.send(404, "text/plain", "SD Card Not Found!");
+    request->send(404, "text/plain", "SD Card Not Found!");
     return;
   }
-  HTTPUpload &upload = server.upload();
-  if (upload.status == UPLOAD_FILE_START)
+
+  if (!index)
   {
     time_lap = millis();
-    DBG_OUTPUT_PORT.println(time_lap);
     secs = 0.00;
-    if (SD.exists((char *)upload.filename.c_str()))
+    if (SD.exists((char *)filename.c_str()))
     {
-      SD.remove((char *)upload.filename.c_str());
+      SD.remove((char *)filename.c_str());
     }
-    uploadFile = SD.open(upload.filename.c_str(), FILE_WRITE);
+    filename.replace(' ','_');
+    uploadFile = SD.open(filename.c_str(), FILE_WRITE);
+    request->_tempFile = uploadFile;
     DBG_OUTPUT_PORT.print("Upload: START, filename: ");
-    DBG_OUTPUT_PORT.println(upload.filename);
+    DBG_OUTPUT_PORT.println(filename);
   }
-  else if (upload.status == UPLOAD_FILE_WRITE)
+  if (len)
   {
     if (uploadFile)
     {
-      uploadFile.write(upload.buf, upload.currentSize);
+      uploadFile.write(data, len);
     }
   }
-  else if (upload.status == UPLOAD_FILE_END)
+  if (final)
   {
     if (uploadFile)
     {
-      uploadFile.close();
+      request->_tempFile.close();
       time_lap = millis() - time_lap;
-      DBG_OUTPUT_PORT.println(time_lap);
       secs = (time_lap / 1000.00);
       String msg = String(secs, 2);
       String webpagea = "";
       webpagea += F("<h3>File was successfully uploaded</h3>");
       webpagea += F("<h2>Uploaded File Name: ");
-      webpagea += upload.filename + "</h2>";
+      webpagea += filename + "</h2>";
       webpagea += F("<h2>File Size: ");
-      webpagea += file_size(upload.totalSize) + "</h2>";
+      webpagea += file_size(index + len) + "</h2>";
       webpagea += F("<h2>Time elapsed: ");
       webpagea += msg;
       webpagea += " seconds</h2><br>";
-      server.send(200, "text/html", webpagea);
+      request->send(200, "text/html", webpagea);
     }
     DBG_OUTPUT_PORT.print("Upload: END, Size: ");
-    DBG_OUTPUT_PORT.println(upload.totalSize);
+    DBG_OUTPUT_PORT.println( String(index + len));
   }
 }
 
-void handleNotFound()
+void onRequest(AsyncWebServerRequest *request)
 {
-  if (hasSD && loadFromSdCard(server.uri()))
-  {
+  String uri = request->url().c_str();
+  if (hasSD && loadFromSdCard(request)){
     return;
   }
-  else if (!hasSD & server.uri().endsWith("/"))
-  {
-    server.send_P(200, "text/html", webpage);
+  else if (!hasSD & uri.endsWith("/")){
+    request->send_P(200, "text/html", webpage);
   }
   String message = "File Not Found\n\n";
   message += "URI: ";
-  message += server.uri();
+  message += uri;
   message += "\nMethod: ";
-  message += (server.method() == HTTP_GET) ? "GET" : "POST";
+  message += (request->method() == HTTP_GET) ? "GET" : "POST";
   message += "\nArguments: ";
-  message += server.args();
-  message += "\n";
-
-  for (uint8_t i = 0; i < server.args(); i++)
+  int args = request->args();
+  for (uint8_t i = 0; i < args; i++)
   {
-    message += " " + server.argName(i) + ": " + server.arg(i) + "\n";
+    String argName = request->argName(i).c_str();
+    String argValue  = request->arg(i).c_str();
+    message += " " + argName + ": " + argValue + "\n";
   }
 
-  server.send(404, "text/plain", message);
+  request->send(404, "text/plain", message);
 }
 
-bool loadFromSdCard(String path)
+bool loadFromSdCard(AsyncWebServerRequest *request)
 {
+  String path = request->url().c_str();
   String dataType = "text/plain";
   if (path.endsWith("/"))
   {
@@ -472,23 +540,51 @@ bool loadFromSdCard(String path)
     return false;
   }
 
-  if (server.hasArg("download"))
+  if (request->hasParam("download"))
   {
     dataType = "application/octet-stream";
   }
 
-  if (server.streamFile(dataFile, dataType) != dataFile.size())
-  {
-    DBG_OUTPUT_PORT.println("Sent less data than expected!");
-  }
 
-  dataFile.close();
+  // AsyncWebServerResponse *response = request->beginChunkedResponse("application/octet-stream", [dataFile](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+  //   return load_data(dataFile, buffer, 2048, index);
+  // });
+  //response->setContentLength(dataFile.size());
+  
+  AsyncWebServerResponse *response = request->beginResponse(
+          dataType,
+          dataFile.size(),
+          [dataFile](uint8_t *buffer, size_t maxLen, size_t total) mutable -> size_t {
+              int bytes = dataFile.read(buffer, maxLen);
+              // close file at the end
+              if (bytes + total == dataFile.size()) dataFile.close();
+              return max(0, bytes); // return 0 even when no bytes were loaded
+          }
+  );
+  request->send(response);
+  // if (server.streamFile(dataFile, dataType) != dataFile.size())
+  // {
+  //   DBG_OUTPUT_PORT.println("Sent less data than expected!");
+  // }
+
+  //dataFile.close();
   return true;
 }
 
 //************************************************************************************//
 //            Utility Functions                                                       //
 //************************************************************************************//
+
+size_t load_data(File f, uint8_t* buffer, size_t maxLen, size_t index) {
+  if (f.available()) {
+    return f.read(buffer, maxLen);
+  }
+  else {
+    return 0;
+  }
+}
+
+
 String file_size(int bytes)
 {
   String fsize = "";
@@ -513,4 +609,11 @@ boolean intervalPassed(uint32_t *previousMillis, uint32_t interval)
     passed = true;
   }
   return passed;
+}
+
+void wakeMyPC() {
+    const char *MACAddress = "xx:xx:xx:xx:xx";
+  
+    WOL.sendMagicPacket(MACAddress); // Send Wake On Lan packet with the above MAC address. Default to port 9.
+    // WOL.sendMagicPacket(MACAddress, 7); // Change the port number
 }

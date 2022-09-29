@@ -1,13 +1,16 @@
 #include <Arduino.h>
-#include <ESP8266WiFi.h>
-#include <ESP8266WebServer.h>
-#include <WebSocketsServer.h>
+#include <ESPAsyncTCP.h>
+#include <ESPAsyncWebServer.h>
 #include <ESP8266mDNS.h>
 #include <NTPClient.h>
 #include <Ticker.h>
 #include <SPI.h>
 #include <SD.h>
 #include <DHT.h>
+#include <WiFiUdp.h>
+#include <WakeOnLan.h>
+// #include "esp_log.h"
+
 
 #define DBG_OUTPUT_PORT Serial
 #define DHTTYPE DHT11
@@ -29,18 +32,25 @@ typedef struct DhtSensorData{
 
 DHT dht(DHTPIN, DHTTYPE);
 boolean initSD();
-void XMLcontent();
-void returnOK();
+void handleXMLRequest(AsyncWebServerRequest *request);
+void returnOK(AsyncWebServerRequest *request);
 void handlePageFromSD();
 void setAPmode();
 void setupWebServerOnRequests();
-bool loadFromSdCard(String path);
+bool loadFromSdCard(AsyncWebServerRequest *request);
 void handleFileUpload();
 void handleNotFound();
 String file_size(int bytes);
-void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length);
 void setRouterConnect();
 void setAPmode();
 DhtSensorData readDhtSensorData();
 boolean intervalPassed(uint32_t* previousMillis, uint32_t interval);
 void logDataToSD(String fileName, String logData);
+void wakeMyPC();
+void handleListSDCardFiles(AsyncWebServerRequest *request);
+String getSDCardList(File dir);
+void handleGetRequest(AsyncWebServerRequest *request);
+size_t load_data(File f, uint8_t* buffer, size_t maxLen, size_t index);
+void onWebSocketEvent(AsyncWebSocket * server, AsyncWebSocketClient * client, AwsEventType type, void * arg, uint8_t *data, size_t length);
+void onUpload(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final);
+void onRequest(AsyncWebServerRequest *request);
