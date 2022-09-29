@@ -120,7 +120,7 @@ const char webpage[] PROGMEM = R"=====(
       myChart = new Chart(ctx, config);
     }
     function init() {
-      Socket = new WebSocket('ws://' + window.location.hostname + ':81/');
+      Socket = new WebSocket('ws://' + window.location.hostname + '/ws');
       Socket.onmessage = function (event) {
         var isJason = false;
         try {
