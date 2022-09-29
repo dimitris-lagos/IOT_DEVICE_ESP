@@ -37,18 +37,6 @@
             chart.update();
         }
 
-        function setMinLast48Hours(chart) {
-            lastStamp = temperatureData[temperatureData.length - 1].x;
-            chart.options.scales.x.min = lastStamp - (3600000 * 48);
-            chart.update();
-        }
-
-        function setMinLast7days(chart) {
-            lastStamp = temperatureData[temperatureData.length - 1].x;
-            chart.options.scales.x.min = lastStamp - (3600000 * 168);
-            chart.update();
-        }
-
         function resetMin(chart) {
             chart.options.scales.x.min = temperatureData[0].x;
             chart.update();
@@ -171,7 +159,6 @@
                             }
                         },
                         x: {
-                            //suggestedMin: new Date(2022, 4, 4),
                             type: 'time',
                             distribution: 'series',
                             time: {
@@ -194,7 +181,7 @@
         }
 
         function init() {
-            Socket = new WebSocket('ws://' + window.location.hostname + '/ws');
+            Socket = new WebSocket('ws://' + window.location.hostname + ':81/');
             Socket.onmessage = function (event) {
                 var isJason = false;
                 try {
@@ -241,9 +228,11 @@
             xhr.onreadystatechange = function () {
                 if (this.readyState == 4 && this.status == 200) {
                     var xmlDoc = this.responseXML;
-                    var statusElement = xmlDoc.getElementsByTagName("status");
-                    document.getElementById("Status").innerHTML = statusElement[0].getElementsByTagName("mode")[0].childNodes[0].nodeValue;
-                    document.getElementById("Ip").innerHTML = statusElement[0].getElementsByTagName("ip")[0].childNodes[0].nodeValue;
+                    var x = xmlDoc.getElementsByTagName("status");
+                    y = x[0].getElementsByTagName("mode")[0].childNodes[0].nodeValue
+                    z = x[0].getElementsByTagName("ip")[0].childNodes[0].nodeValue
+                    document.getElementById("Status").innerHTML = y;
+                    document.getElementById("Ip").innerHTML = z;
                 }
             };
             xhr.open("GET", url, true);
@@ -269,8 +258,6 @@
         <div>
             <button class="btn" type="button" onclick="setMinLastHour(myChart)">Last Hour</button>
             <button class="btn" type="button" onclick="setMinLast24Hours(myChart)">Last 24 Hours</button>
-            <button class="btn" type="button" onclick="setMinLast48Hours(myChart)">Last 48 Hours</button>
-            <button class="btn" type="button" onclick="setMinLast7days(myChart)">Last 7 Days</button>
             <button class="btn" type="button" onclick="resetMin(myChart)">All data</button>
         </div>
         <div class="sensor-output">
